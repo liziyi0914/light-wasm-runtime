@@ -1,0 +1,10 @@
+[package]
+name = "light-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+lazy_static = "1.5.0"
+thiserror = "1.0.63"
+wasmparser = "0.215.0"
