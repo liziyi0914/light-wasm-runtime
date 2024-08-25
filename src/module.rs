@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use wasmparser::{CompositeInnerType, Export, Global, Import, MemoryType, Operator, Parser, Payload, RecGroup, Table, TypeRef, ValType};
+
 use anyhow::{anyhow, Result};
+use wasmparser::{CompositeInnerType, Data, Export, Global, Import, MemoryType, Operator, Parser, Payload, RecGroup, Table, TypeRef, ValType};
 
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
@@ -20,6 +21,8 @@ pub struct Module<'a> {
     pub tables: Vec<Table<'a>>,
     pub memories: Vec<MemoryType>,
     pub globals: Vec<Global<'a>>,
+    pub datas: Vec<Data<'a>>,
+    pub code_locals: HashMap<u32, Vec<ValType>>,
 }
 
 impl <'a> Module<'a> {
@@ -118,14 +121,31 @@ impl <'a> Module<'a> {
                 Payload::StartSection { .. } => {}
                 Payload::ElementSection(..) => {}
                 Payload::DataCountSection { .. } => {}
-                Payload::DataSection(..) => {
-                    // TODO
+                Payload::DataSection(section) => {
+                    // Data
+                    for res in section.into_iter_with_offsets() {
+                        if let Ok((_, data)) = res {
+                            module.datas.push(data);
+                        }
+                    }
                 }
                 Payload::CodeSectionStart { .. } => {
                     // TODO
                 }
                 Payload::CodeSectionEntry(section) => {
                     // Code
+                    if let Ok(reader) = section.get_locals_reader() {
+                        let mut types = vec![];
+                        for res in reader.into_iter() {
+                            if let Ok((count, typ)) = res {
+                                for _ in 0..count {
+                                    types.push(typ);
+                                }
+                            }
+                        }
+                        module.code_locals.insert(code_entry_index, types);
+                    }
+
                     if let Ok(reader) = section.get_operators_reader() {
                         for res in reader.into_iter_with_offsets() {
                             if let Ok((op, _)) = res {
@@ -164,7 +184,7 @@ impl <'a> Module<'a> {
         Ok(module)
     }
 
-    pub fn get_function_info(&self, index: u32) -> Result<(&[ValType], &[ValType], bool, u32)> {
+    pub fn get_function_info(&self, index: u32) -> Result<(Vec<ValType>, Vec<ValType>, bool, u32)> {
         let params: &[ValType];
         let results: &[ValType];
         let func_type = self.functions
@@ -184,7 +204,7 @@ impl <'a> Module<'a> {
         return if let CompositeInnerType::Func(fun) = typ {
             params = fun.params();
             results = fun.results();
-            Ok((params, results, is_import, func_type.index))
+            Ok((params.to_vec(), results.to_vec(), is_import, func_type.index))
         } else {
             Err(anyhow!("function signature not found"))
         }
