@@ -2,7 +2,7 @@ use std::ops::{Add, Div, Mul, Neg, Shl, Shr, Sub};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
-use wasmparser::{BlockType, Operator, ValType};
+use wasmparser::{BlockType, ConstExpr, Operator, ValType};
 
 use crate::base::Val;
 use crate::instance::{MemoryDef, RuntimeError, Stack, VarMap};
@@ -24,6 +24,12 @@ pub enum OpType {
     If {
         else_branch: Option<u32>,
     },
+}
+
+#[derive(Debug)]
+pub struct FunctionTypeDesc {
+    pub params: Vec<ValType>,
+    pub results: Vec<ValType>,
 }
 
 impl OperatorDesc {
@@ -196,8 +202,10 @@ impl Machine {
             ops,
             Arc::new(OperatorDesc::build(ops)),
             &memory,
+            |_| bail!("Cannot get type info"),
             |_| bail!("Cannot get function info"),
             |_, _| bail!("Cannot call function"),
+            |_, _| bail!("Cannot call function indirect"),
         )?;
 
         Ok(())
@@ -210,8 +218,10 @@ impl Machine {
         ops: &Vec<Operator>,
         ops_desc: Arc<Vec<OperatorDesc>>,
         memory: &MemoryDef,
-        get_function_info: impl Fn(u32) -> Result<(Vec<ValType>, Vec<ValType>, bool, u32)>,
+        get_function_type_info: impl Fn(u32) -> Result<FunctionTypeDesc>,
+        get_function_info: impl Fn(u32) -> Result<(FunctionTypeDesc, bool, u32)>,
         call_function: impl Fn(u32, Vec<Val>) -> Result<Vec<Val>>,
+        call_indirect_function: impl Fn(u32, Vec<Val>) -> Result<Vec<Val>>,
     ) -> Result<()> {
         let mut index = 0u32;
 
@@ -226,7 +236,9 @@ impl Machine {
 
             match op {
                 Operator::Call { function_index } => {
-                    let (params, _, _, _) = get_function_info(*function_index)?;
+                    let (desc, _, _) = get_function_info(*function_index)?;
+
+                    let params = desc.params;
 
                     let mut args = vec![];
 
@@ -307,7 +319,29 @@ impl Machine {
                         next = ops_desc.calc_break(index, targets.default() + 1)?;
                     }
                 }
-                // Operator::CallIndirect { .. } => {}
+                Operator::CallIndirect { type_index, .. } => {
+                    let index = stack.pop_i32()?;
+
+                    let typ = get_function_type_info(*type_index)?;
+
+                    let mut args = vec![];
+
+                    for typ in typ.params.iter().rev() {
+                        let val = stack.pop().ok_or(anyhow!("Cannot pop stack"))?;
+
+                        if &val.to_type() != typ {
+                            return Err(anyhow!("Wrong type"));
+                        }
+
+                        args.insert(0, val);
+                    }
+
+                    let ret = call_indirect_function(index as u32, args)?;
+
+                    for val in ret {
+                        stack.push(val);
+                    }
+                }
                 // Operator::ReturnCall { .. } => {}
                 // Operator::ReturnCallIndirect { .. } => {}
                 Operator::Drop => {
@@ -347,7 +381,7 @@ impl Machine {
                 Operator::GlobalGet { global_index } => {
                     let val = global
                         .get(*global_index)
-                        .ok_or(anyhow!("Cannot get global variable"))?;
+                        .ok_or(anyhow!("Cannot get global variable {}", global_index))?;
                     stack.push(val.clone());
                 }
                 Operator::GlobalSet { global_index } => {
@@ -556,7 +590,7 @@ impl Machine {
                     stack.push(memory.page_count() as u32 as i32);
                 }
                 Operator::MemoryGrow { .. } => {
-                    let c = stack.pop_i32()?;
+                    let c = memory.page_count() as i32;
                     let v = stack.pop_i32()?;
                     match memory.grow_page(v as u32 as usize) {
                         Ok(_) => {
@@ -1328,5 +1362,23 @@ impl Machine {
         }
 
         Ok(())
+    }
+}
+
+pub trait ConstExprEx {
+    fn run(&self) -> Result<Val>;
+}
+
+impl ConstExprEx for ConstExpr<'_> {
+    fn run(&self) -> Result<Val> {
+        let mut ops = vec![];
+        for res2 in self.get_operators_reader().into_iter_with_offsets() {
+            if let Ok((op, _)) = res2 {
+                ops.push(op);
+            }
+        }
+        let st = Stack::new();
+        Machine::simply_run(&st, &ops)?;
+        st.pop_res()
     }
 }

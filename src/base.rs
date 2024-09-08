@@ -27,6 +27,23 @@ impl Val {
         }
     }
 
+    pub fn is_type(&self, typ: ValType) -> bool {
+        match self {
+            Val::I32(_) => {
+                typ == ValType::I32
+            }
+            Val::I64(_) => {
+                typ == ValType::I64
+            }
+            Val::F32(_) => {
+                typ == ValType::F32
+            }
+            Val::F64(_) => {
+                typ == ValType::F64
+            }
+        }
+    }
+
     pub fn default_value(typ: ValType) -> Self {
         match typ {
             ValType::I32 => {

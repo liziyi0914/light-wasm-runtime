@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use wasmparser::{CompositeInnerType, Data, Export, Global, Import, MemoryType, Operator, Parser, Payload, RecGroup, Table, TypeRef, ValType};
+use wasmparser::{CompositeInnerType, Data, Element, Export, Global, Import, MemoryType, Operator, Parser, Payload, RecGroup, Table, TypeRef, ValType};
+use crate::machine::FunctionTypeDesc;
 
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
@@ -11,7 +12,7 @@ pub struct FunctionRef {
     pub import: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct Module<'a> {
     pub types: Vec<RecGroup>,
     pub imports: Vec<Import<'a>>,
@@ -23,14 +24,15 @@ pub struct Module<'a> {
     pub globals: Vec<Global<'a>>,
     pub datas: Vec<Data<'a>>,
     pub code_locals: HashMap<u32, Vec<ValType>>,
+    pub elements: Vec<Element<'a>>,
 }
 
-impl <'a> Module<'a> {
+impl<'a> Module<'a> {
     pub fn new() -> Self {
         Module::default()
     }
 
-    pub fn parse(data: &'static [u8]) -> Result<Module> {
+    pub fn parse(data: &'static [u8]) -> Result<Module<'static>> {
         let parser = Parser::default();
 
         let mut module = Module::new();
@@ -119,7 +121,14 @@ impl <'a> Module<'a> {
                     }
                 }
                 Payload::StartSection { .. } => {}
-                Payload::ElementSection(..) => {}
+                Payload::ElementSection(section) => {
+                    // Element
+                    for res in section.into_iter_with_offsets() {
+                        if let Ok((_, ele)) = res {
+                            module.elements.push(ele);
+                        }
+                    }
+                }
                 Payload::DataCountSection { .. } => {}
                 Payload::DataSection(section) => {
                     // Data
@@ -184,16 +193,9 @@ impl <'a> Module<'a> {
         Ok(module)
     }
 
-    pub fn get_function_info(&self, index: u32) -> Result<(Vec<ValType>, Vec<ValType>, bool, u32)> {
-        let params: &[ValType];
-        let results: &[ValType];
-        let func_type = self.functions
-            .get(index as usize)
-            .ok_or(anyhow!("function not found"))?;
-        let func_type_index = func_type.type_ref;
-        let is_import = func_type.import;
+    pub fn get_function_type_info(&self, index: u32) -> Result<FunctionTypeDesc> {
         let type_group = self.types
-            .get(func_type_index as usize)
+            .get(index as usize)
             .ok_or(anyhow!("type not found"))?;
         let types: Vec<_> = type_group.types().collect();
         if types.len() < 1 {
@@ -202,11 +204,24 @@ impl <'a> Module<'a> {
         let typ = &types[0].composite_type.inner;
 
         return if let CompositeInnerType::Func(fun) = typ {
-            params = fun.params();
-            results = fun.results();
-            Ok((params.to_vec(), results.to_vec(), is_import, func_type.index))
+            let params = fun.params();
+            let results = fun.results();
+            Ok(FunctionTypeDesc {
+                params: params.to_vec(),
+                results: results.to_vec(),
+            })
         } else {
             Err(anyhow!("function signature not found"))
-        }
+        };
+    }
+
+    pub fn get_function_info(&self, index: u32) -> Result<(FunctionTypeDesc, bool, u32)> {
+        let func_type = self.functions
+            .get(index as usize)
+            .ok_or(anyhow!("function not found"))?;
+        let func_type_index = func_type.type_ref;
+        let is_import = func_type.import;
+
+        Ok((self.get_function_type_info(func_type_index)?, is_import, func_type.index))
     }
 }

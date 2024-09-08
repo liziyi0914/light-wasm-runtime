@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
 use thiserror::Error;
-use wasmparser::{DataKind, ExternalKind, Operator, TypeRef};
+use wasmparser::{DataKind, ElementItems, ElementKind, ExternalKind, Operator, TableInit, TypeRef};
 
 use crate::base::Val;
-use crate::machine::{Machine, OperatorDesc};
+use crate::machine::{ConstExprEx, Machine, OperatorDesc};
 use crate::module::Module;
 
 #[allow(dead_code)]
@@ -24,10 +24,12 @@ pub enum RuntimeError {
     Other(anyhow::Error),
 }
 
+#[allow(unused)]
 #[derive(Clone)]
 pub enum ImportItem {
     Function(Arc<dyn Fn(Vec<Val>) -> Result<Vec<Val>>>),
     Memory(Arc<MemoryDef>),
+    Table(Arc<TableDef>),
 }
 
 #[derive(Clone)]
@@ -55,38 +57,64 @@ impl ImportDef {
     }
 }
 
+static CHUNK_SIZE: u32 = 32;
+
 pub struct MemoryDef {
-    pub data: Mutex<Vec<u8>>,
+    page: Mutex<usize>,
+    data: Mutex<HashMap<u32, Vec<u8>>>,
 }
 
 impl MemoryDef {
     pub fn new(page: usize) -> Self {
         MemoryDef {
-            data: Mutex::new(vec![0; page * 64 * 1024]),
+            page: Mutex::new(page),
+            data: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn page_count(&self) -> usize {
-        self.data.lock().unwrap().len() / 64 / 1024
+        *self.page.lock().unwrap()
     }
 
-    pub fn grow_page(&self, page: usize) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
+    pub fn grow_page(&self, n: usize) -> Result<()> {
+        let mut page = self.page.lock().unwrap();
 
-        data.extend(vec![0u8; page * 64 * 1024]);
+        *page += n;
 
         Ok(())
     }
 
-    pub fn write(&self, offset: usize, values: &[u8]) -> Result<()> {
-        let len = values.len();
+    pub fn write(&self, offset0: usize, values: &[u8]) -> Result<()> {
+        let mut len = values.len() as u32;
+        let mut offset = offset0 as u32;
         let mut data = self.data.lock().unwrap();
+        let mut values_offset = 0usize;
 
-        if data.len() < offset + len {
-            bail!("Memory out of bounds");
+        while len > 0 {
+            let part_index = offset / CHUNK_SIZE;
+            let part_offset = offset % CHUNK_SIZE;
+            let part_ava_len = CHUNK_SIZE - part_offset;
+            let part_len = if part_ava_len < len { part_ava_len } else { len };
+
+            if !data.contains_key(&part_index) {
+                data.insert(part_index, vec![0u8; CHUNK_SIZE as usize]);
+            }
+            let part = data.get_mut(&part_index).unwrap();
+
+            for i in 0..part_len {
+                part[(part_offset + i) as usize] = values[values_offset + i as usize];
+            }
+
+            len -= part_len;
+            values_offset += part_len as usize;
+            offset += part_len;
         }
 
-        data[offset..offset + len].copy_from_slice(values);
+        // if data.len() < offset + len {
+        //     bail!("Memory out of bounds");
+        // }
+        //
+        // data[offset..offset + len].copy_from_slice(values);
         Ok(())
     }
 
@@ -120,14 +148,32 @@ impl MemoryDef {
         Ok(())
     }
 
-    fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
-        let data = self.data.lock().unwrap();
+    pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let mut result = vec![];
 
-        if data.len() < offset + len {
-            bail!("Memory out of bounds");
+        let mut data = self.data.lock().unwrap();
+        let mut len = len as u32;
+
+        while len != 0 {
+            let part_index = offset as u32 / CHUNK_SIZE;
+            let part_offset = offset as u32 % CHUNK_SIZE;
+            let part_ava_len = CHUNK_SIZE - part_offset;
+            let part_len = if part_ava_len < len { part_ava_len } else { len };
+
+            if !data.contains_key(&part_index) {
+                result.extend(vec![0u8; part_len as usize]);
+            } else {
+                let part = data.get_mut(&part_index).unwrap();
+
+                for i in 0..part_len {
+                    result.push(part[(part_offset + i) as usize]);
+                }
+            }
+
+            len -= part_len;
         }
 
-        Ok(data[offset..offset + len].to_vec())
+        Ok(result)
     }
 
     fn read_addr(&self, addr: u64, offset: u64, align: u64, len: usize) -> Result<Vec<u8>> {
@@ -167,6 +213,38 @@ impl MemoryDef {
             result[6],
             result[7]
         ]))
+    }
+}
+
+#[allow(unused)]
+pub struct TableDef {
+    size: u32,
+    functions: Mutex<HashMap<u32, Arc<dyn Fn(Vec<Val>) -> Result<Vec<Val>>>>>,
+}
+
+impl TableDef {
+    pub fn new(size: u32) -> Self {
+        TableDef {
+            size,
+            functions: Mutex::new(HashMap::default()),
+        }
+    }
+
+    pub fn set_function(&self, index: u32, f: impl Fn(Vec<Val>) -> Result<Vec<Val>> + 'static) {
+        let mut functions = self.functions.lock().unwrap();
+        functions.insert(index, Arc::new(f));
+    }
+
+    pub fn call(&self, index: u32, args: Vec<Val>) -> Result<Vec<Val>> {
+        let f = {
+            let functions = self.functions.lock().unwrap();
+            let f_opt = functions.get(&index);
+            f_opt.map(|ff|ff.clone())
+        };
+        if let Some(ff) = f {
+            return ff(args);
+        }
+        bail!(RuntimeError::Other(anyhow!("Not found function in table")))
     }
 }
 
@@ -279,10 +357,11 @@ pub struct Instance<'a> {
     imports: Vec<ImportDef>,
     memory_def: Arc<MemoryDef>,
     ops_desc_cache: Mutex<HashMap<u32, Arc<Vec<OperatorDesc>>>>,
+    table_def: Arc<TableDef>,
 }
 
 impl<'a> Instance<'a> {
-    pub fn new(module: &Module<'a>, imports: &Vec<ImportDef>) -> Result<Self> {
+    pub fn new(module: &Module<'static>, imports: &Vec<ImportDef>) -> Result<Arc<Self>> {
         // 初始化内存
         let mem = {
             let mem_opt = module.memories.first();
@@ -327,15 +406,7 @@ impl<'a> Instance<'a> {
                         bail!(RuntimeError::Other(anyhow!("Not support passive data section")));
                     }
                     DataKind::Active { offset_expr, .. } => {
-                        let mut ops = vec![];
-                        for res2 in offset_expr.get_operators_reader().into_iter_with_offsets() {
-                            if let Ok((op, _)) = res2 {
-                                ops.push(op);
-                            }
-                        }
-                        let st = Stack::new();
-                        Machine::simply_run(&st, &ops)?;
-                        st.pop_i32()?
+                        offset_expr.run()?.to_i32().unwrap()
                     }
                 }
             };
@@ -343,14 +414,103 @@ impl<'a> Instance<'a> {
             mem.write(offset as usize, bytes)?;
         }
 
-        let inst = Instance {
+        // 初始化Table
+        let tab = {
+            let tab_opt = module.tables.first();
+            if let Some(tab) = tab_opt {
+                match &tab.init {
+                    TableInit::Expr(_) => {
+                        bail!(RuntimeError::Other(anyhow!("Not support Expr table section")));
+                    }
+                    _ => {}
+                }
+                let ty = tab.ty;
+                if !ty.element_type.is_func_ref() {
+                    bail!(RuntimeError::Other(anyhow!("Not support table section type: {}", ty.element_type.to_string())));
+                }
+
+                Arc::new(TableDef::new(ty.initial as u32))
+            } else {
+                let import_opt = module.imports
+                    .iter()
+                    .filter(|import| matches!(import.ty, TypeRef::Table(..)))
+                    .nth(0);
+
+                if let Some(import) = import_opt {
+                    let import_def_opt = imports
+                        .iter()
+                        .filter(|im| im.name == import.name && im.module == import.module)
+                        .nth(0);
+
+                    if let Some(import_def) = import_def_opt {
+                        match &import_def.item {
+                            ImportItem::Table(tab) => {
+                                tab.clone()
+                            }
+                            _ => {
+                                Arc::new(TableDef::new(0))
+                            }
+                        }
+                    } else {
+                        Arc::new(TableDef::new(0))
+                    }
+                } else {
+                    Arc::new(TableDef::new(0))
+                }
+            }
+        };
+
+        let global = {
+            let global = VarMap::default();
+
+            for (index, var) in module.globals.iter().enumerate() {
+                let val = var.init_expr.run()?;
+                if val.is_type(var.ty.content_type) {
+                    global.set(index as u32, val);
+                }
+            }
+
+            global
+        };
+
+        let inst = Arc::new(Instance {
             module: module.clone(),
             stack: Stack::new(),
-            global: VarMap::default(),
+            global: global,
             imports: imports.clone(),
             memory_def: mem,
+            table_def: tab.clone(),
             ops_desc_cache: Default::default(),
-        };
+        });
+
+        // 初始化Element
+        for ele in &module.elements {
+            let offset = match &ele.kind {
+                ElementKind::Active { offset_expr, .. } => {
+                    offset_expr.run()?.to_i32().unwrap() as u32
+                }
+                _ => {
+                    bail!(RuntimeError::Other(anyhow!("Not support element section")));
+                }
+            };
+            match &ele.items {
+                ElementItems::Functions(section) => {
+                    let mut i = 0u32;
+                    for res in section.clone().into_iter_with_offsets() {
+                        if let Ok((_, index)) = res {
+                            let inst_arc = inst.clone();
+                            tab.set_function(offset + i, move |args| {
+                                inst_arc.call_function(index, args)
+                            });
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    bail!(RuntimeError::Other(anyhow!("Not support element section")));
+                }
+            }
+        }
 
         Ok(inst)
     }
@@ -373,11 +533,11 @@ impl<'a> Instance<'a> {
         // println!(">>>>>> {:?}", args);
 
         // 检查函数签名
-        let (params, results, is_import, index) = self.module.get_function_info(func_index)?;
-        if params.len() != args.len() {
+        let (function_type, is_import, index) = self.module.get_function_info(func_index)?;
+        if function_type.params.len() != args.len() {
             return Err(anyhow!("function signature error: {}", "params length not match"));
         }
-        for (i, param) in params.iter().enumerate() {
+        for (i, param) in function_type.params.iter().enumerate() {
             if param != &args[i].to_type() {
                 return Err(anyhow!("function signature error: {}", format!("param[{}] type not match", i)));
             }
@@ -434,7 +594,7 @@ impl<'a> Instance<'a> {
             // 返回值出栈
             let mut ret = vec![];
             {
-                for result_type in results {
+                for result_type in function_type.results {
                     let value = self.stack.pop()
                         .ok_or(anyhow!("Empty stack"))?;
                     if result_type == value.to_type() {
@@ -466,8 +626,10 @@ impl<'a> Instance<'a> {
             ops_desc,
             &self.memory_def,
 
+            |index| self.module.get_function_type_info(index),
             |index| self.module.get_function_info(index),
             |index, args| self.call_function(index, args),
+            |index, args| self.table_def.call(index, args),
         )?;
 
         Ok(())
